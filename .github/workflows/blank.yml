@@ -1,0 +1,348 @@
+# This is a basic workflow to help you get started with Actions
+
+name: CI
+
+# Controls when the workflow will run
+on:
+  # Triggers the workflow on push or pull request events but only for the "main" branch
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  # This workflow contains a single job called "build"
+  build:
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - uses: actions/checkout@v4
+
+      # Runs a single command using the runners shell
+      - name: Run a one-line script
+        run: echo Hello, world!
+
+
+library(shiny)
+library(shinythemes)
+library(tidyverse)
+library(tidytext)
+library(wordcloud)
+library(RColorBrewer)
+library(DT)
+library(udpipe)
+library(textrank)
+library(lattice)
+
+# UI
+ui <- fluidPage(
+  theme = shinytheme("flatly"),
+  titlePanel("Qualitative Data Analysis Tool"),
+  sidebarLayout(
+    sidebarPanel(
+      fileInput("file", "Upload Text Data (CSV or TXT)",
+                accept = c(".csv", ".txt")),
+      checkboxInput("header", "Header in CSV", TRUE),
+      
+      conditionalPanel(
+        condition = "input.tabs == 'Data Exploration'",
+        sliderInput("word_freq", "Minimum Word Frequency:",
+                    min = 1, max = 50, value = 5),
+        sliderInput("max_words", "Maximum Words in Cloud:",
+                    min = 10, max = 300, value = 100)
+      ),
+      
+      conditionalPanel(
+        condition = "input.tabs == 'Coding'",
+        textInput("new_code", "New Code:"),
+        actionButton("add_code", "Add Code"),
+        br(), br(),
+        selectInput("active_code", "Select Code to Apply:", choices = NULL),
+        actionButton("apply_code", "Apply Code to Selection"),
+        br(), br(),
+        downloadButton("download_coded", "Download Coded Data")
+      ),
+      
+      conditionalPanel(
+        condition = "input.tabs == 'Theme Analysis'",
+        selectInput("theme_method", "Analysis Method:",
+                    choices = c("Keyness", "Collocation", "Co-occurrence")),
+        sliderInput("theme_topn", "Number of Terms to Show:",
+                    min = 5, max = 50, value = 15)
+      ),
+      
+      width = 3
+    ),
+    
+    mainPanel(
+      tabsetPanel(id = "tabs",
+        tabPanel("Data Overview",
+                 h3("Data Summary"),
+                 verbatimTextOutput("summary"),
+                 h3("Data Preview"),
+                 dataTableOutput("preview")),
+        
+        tabPanel("Data Exploration",
+                 h3("Word Frequency"),
+                 plotOutput("freq_plot"),
+                 h3("Word Cloud"),
+                 plotOutput("wordcloud"),
+                 h3("Top Terms Table"),
+                 dataTableOutput("word_table")),
+        
+        tabPanel("Coding",
+                 h3("Available Codes"),
+                 verbatimTextOutput("code_list"),
+                 h3("Text for Coding"),
+                 uiOutput("text_selection"),
+                 h3("Coded Data"),
+                 dataTableOutput("coded_data")),
+        
+        tabPanel("Theme Analysis",
+                 h3("Key Themes"),
+                 plotOutput("theme_plot"),
+                 h3("Theme Details"),
+                 dataTableOutput("theme_table")),
+        
+        tabPanel("Sentiment Analysis",
+                 h3("Sentiment Distribution"),
+                 plotOutput("sentiment_plot"),
+                 h3("Sentiment Over Time (if date available)"),
+                 plotOutput("sentiment_time"))
+      ),
+      width = 9
+    )
+  )
+)
+
+# Server
+server <- function(input, output, session) {
+  
+  # Reactive data storage
+  rv <- reactiveValues(
+    data = NULL,
+    coded_data = NULL,
+    codes = c("positive", "negative", "improvement"),
+    selected_text = NULL,
+    ud_model = NULL
+  )
+  
+  # Load NLP model (simplified for example)
+  observe({
+    # In a real app, you'd load a proper udpipe model
+    # rv$ud_model <- udpipe_load_model("english-ewt-ud-2.5-191206.udpipe")
+  })
+  
+  # Load data
+  observeEvent(input$file, {
+    req(input$file)
+    
+    ext <- tools::file_ext(input$file$name)
+    
+    if (ext == "csv") {
+      rv$data <- read.csv(input$file$datapath, header = input$header)
+    } else if (ext == "txt") {
+      text <- readLines(input$file$datapath)
+      rv$data <- data.frame(text = text, stringsAsFactors = FALSE)
+    }
+    
+    # Initialize coded data
+    if (!is.null(rv$data)) {
+      rv$coded_data <- rv$data
+      if (!"codes" %in% names(rv$coded_data)) {
+        rv$coded_data$codes <- ""
+      }
+    }
+    
+    # Update code selection
+    updateSelectInput(session, "active_code", choices = rv$codes)
+  })
+  
+  # Data summary
+  output$summary <- renderPrint({
+    req(rv$data)
+    cat("Number of documents/entries:", nrow(rv$data), "\n")
+    cat("Variables/columns:", paste(names(rv$data), collapse = ", "), "\n\n")
+    
+    # Count total words if text column exists
+    if ("text" %in% names(rv$data)) {
+      total_words <- sum(sapply(strsplit(rv$data$text, "\\s+"), length))
+      cat("Total words in text:", total_words, "\n")
+    }
+  })
+  
+  # Data preview
+  output$preview <- renderDT({
+    req(rv$data)
+    datatable(rv$data, options = list(scrollX = TRUE, pageLength = 5))
+  })
+  
+  # Word frequency analysis
+  word_freq <- reactive({
+    req(rv$data, "text" %in% names(rv$data))
+    
+    rv$data %>%
+      unnest_tokens(word, text) %>%
+      anti_join(stop_words) %>%
+      count(word, sort = TRUE) %>%
+      filter(n >= input$word_freq)
+  })
+  
+  # Word frequency plot
+  output$freq_plot <- renderPlot({
+    req(word_freq())
+    
+    word_freq() %>%
+      head(20) %>%
+      mutate(word = fct_reorder(word, n)) %>%
+      ggplot(aes(n, word)) +
+      geom_col(fill = "steelblue") +
+      labs(x = "Frequency", y = NULL) +
+      theme_minimal()
+  })
+  
+  # Word cloud
+  output$wordcloud <- renderPlot({
+    req(word_freq())
+    
+    wordcloud(words = word_freq()$word,
+              freq = word_freq()$n,
+              max.words = input$max_words,
+              colors = brewer.pal(8, "Dark2"),
+              scale = c(3, 0.5))
+  })
+  
+  # Word frequency table
+  output$word_table <- renderDT({
+    req(word_freq())
+    datatable(word_freq(), options = list(pageLength = 10))
+  })
+  
+  # Code management
+  observeEvent(input$add_code, {
+    req(input$new_code != "")
+    rv$codes <- unique(c(rv$codes, input$new_code))
+    updateSelectInput(session, "active_code", choices = rv$codes)
+    updateTextInput(session, "new_code", value = "")
+  })
+  
+  # Display available codes
+  output$code_list <- renderPrint({
+    cat("Available codes:", paste(rv$codes, collapse = ", "))
+  })
+  
+  # Text selection for coding
+  output$text_selection <- renderUI({
+    req(rv$data, "text" %in% names(rv$data))
+    
+    # Simple implementation - in real app you'd have better text selection
+    selectInput("text_id", "Select Text to Code:",
+                choices = 1:nrow(rv$data),
+                selected = 1)
+  })
+  
+  # Apply code to selected text
+  observeEvent(input$apply_code, {
+    req(input$text_id, input$active_code)
+    
+    text_id <- as.numeric(input$text_id)
+    current_codes <- rv$coded_data$codes[text_id]
+    
+    if (current_codes == "") {
+      new_codes <- input$active_code
+    } else {
+      current_codes_vec <- unlist(strsplit(current_codes, ","))
+      if (!input$active_code %in% current_codes_vec) {
+        new_codes <- paste(c(current_codes_vec, input$active_code), collapse = ",")
+      } else {
+        new_codes <- current_codes
+      }
+    }
+    
+    rv$coded_data$codes[text_id] <- new_codes
+  })
+  
+  # Display coded data
+  output$coded_data <- renderDT({
+    req(rv$coded_data)
+    datatable(rv$coded_data, options = list(scrollX = TRUE, pageLength = 5))
+  })
+  
+  # Download coded data
+  output$download_coded <- downloadHandler(
+    filename = function() {
+      paste0("coded_data_", Sys.Date(), ".csv")
+    },
+    content = function(file) {
+      write.csv(rv$coded_data, file, row.names = FALSE)
+    }
+  )
+  
+  # Theme analysis
+  output$theme_plot <- renderPlot({
+    req(rv$data, "text" %in% names(rv$data), input$theme_topn)
+    
+    # Simplified theme analysis - in real app you'd use more sophisticated NLP
+    top_terms <- word_freq() %>%
+      head(input$theme_topn)
+    
+    dotplot(n ~ word, data = top_terms,
+            xlab = "Frequency", ylab = "Term",
+            main = "Top Terms in Corpus")
+  })
+  
+  output$theme_table <- renderDT({
+    req(word_freq())
+    datatable(word_freq() %>% head(input$theme_topn), 
+              options = list(pageLength = 10))
+  })
+  
+  # Sentiment analysis (simplified)
+  output$sentiment_plot <- renderPlot({
+    req(rv$data, "text" %in% names(rv$data))
+    
+    sentiment <- rv$data %>%
+      unnest_tokens(word, text) %>%
+      inner_join(get_sentiments("bing")) %>%
+      count(sentiment) %>%
+      mutate(sentiment = factor(sentiment, levels = c("positive", "negative")))
+    
+    if (nrow(sentiment) > 0) {
+      ggplot(sentiment, aes(x = sentiment, y = n, fill = sentiment)) +
+        geom_col() +
+        scale_fill_manual(values = c("positive" = "darkgreen", "negative" = "red")) +
+        labs(title = "Sentiment Distribution", x = NULL, y = "Count") +
+        theme_minimal()
+    } else {
+      plot(1, 1, type = "n", axes = FALSE, xlab = "", ylab = "",
+           main = "No sentiment words found")
+      text(1, 1, "No sentiment words found using Bing lexicon")
+    }
+  })
+}
+
+# Run the application
+shinyApp(ui = ui, server = server)
+
+
+
+
+
+
+
+
+
+        
+
+      # Runs a set of commands using the runners shell
+      - name: Run a multi-line script
+        run: |
+          echo Add other actions to build,
+          echo test, and deploy your project.
